@@ -1,0 +1,171 @@
+name: Test NebulaFD
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-2022
+
+    env:
+      GAME_URL:   "https://td.sohil876.workers.dev/1:/konosuba_revival_of_beldia.zip"
+      NEBULA_URL: "https://td.sohil876.workers.dev/1:/Nebula.zip"
+
+    steps:
+      - name: Install .NET 6 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+
+      - name: Verify .NET runtimes
+        shell: pwsh
+        run: dotnet --list-runtimes
+
+      - name: Download + extract NebulaFD (patched build)
+        shell: pwsh
+        run: |
+          curl.exe -L -o Nebula.zip "$env:NEBULA_URL"
+          Expand-Archive -Path Nebula.zip -DestinationPath nebula -Force
+          Write-Host "--- nebula/ top level ---"
+          Get-ChildItem nebula/ | Select-Object Name, Length
+
+      - name: Download + extract game
+        shell: pwsh
+        run: |
+          curl.exe -L -o game.zip "$env:GAME_URL"
+          Expand-Archive -Path game.zip -DestinationPath game -Force
+
+      - name: Verify layout
+        shell: pwsh
+        run: |
+          $checks = @(
+            "nebula/Nebula.exe",
+            "nebula/Nebula.Core.dll",
+            "nebula/Tools/GameDumper.dll",
+            "game/data/konosuba.exe"
+          )
+          foreach ($c in $checks) {
+            $ok = Test-Path $c
+            Write-Host ("{0,-40} {1}" -f $c, $(if ($ok) { "OK" } else { "MISSING!" }))
+            if (-not $ok) { throw "Required file missing: $c" }
+          }
+
+      - name: "TEST 1 — -listtools (discover tool names)"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          New-Item -ItemType Directory -Force "$root/logs" | Out-Null
+          & "$root/nebula/Nebula.exe" -path "$root/game/data/konosuba.exe" -forcetype exe -listtools -closeonfinish *>&1 |
+            Tee-Object -FilePath "$root/logs/01_listtools.log"
+          Write-Host "EXIT: $LASTEXITCODE"
+
+      - name: "TEST 2 — read-only pass (no -tool, just verify headless read works)"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          & "$root/nebula/Nebula.exe" -path "$root/game/data/konosuba.exe" -forcetype exe -closeonfinish *>&1 |
+            Tee-Object -FilePath "$root/logs/02_readonly.log"
+          Write-Host "EXIT: $LASTEXITCODE"
+
+      - name: "TEST 3 — MFA Parser tool (existing tool via CLI)"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          & "$root/nebula/Nebula.exe" -path "$root/game/data/konosuba.exe" -forcetype exe -tool "MFA Parser" -closeonfinish *>&1 |
+            Tee-Object -FilePath "$root/logs/03_mfa_parser.log"
+          Write-Host "EXIT: $LASTEXITCODE"
+          # Check if MFA was produced
+          $mfa = Get-ChildItem "$root/nebula" -Recurse -Filter *.mfa -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -ne "template.mfa" }
+          if ($mfa) { Write-Host "MFA produced: $($mfa.FullName) ($([math]::Round($mfa.Length/1MB,1)) MB)" }
+          else      { Write-Host "WARNING: no MFA produced" }
+
+      - name: "TEST 4 — JSON Dump tool (our new tool)"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          & "$root/nebula/Nebula.exe" -path "$root/game/data/konosuba.exe" -forcetype exe -tool "JSON Dump" -closeonfinish *>&1 |
+            Tee-Object -FilePath "$root/logs/04_json_dump_exe.log"
+          Write-Host "EXIT: $LASTEXITCODE"
+          # Check if JSON was produced
+          $json = Get-ChildItem "$root/nebula" -Recurse -Filter game_model.json -ErrorAction SilentlyContinue
+          if ($json) { Write-Host "JSON produced: $($json.FullName) ($([math]::Round($json.Length/1KB,1)) KB)" }
+          else       { Write-Host "WARNING: no game_model.json produced" }
+
+      - name: "TEST 5 — read MFA with JSON Dump (if MFA exists from TEST 3)"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          $mfa = Get-ChildItem "$root/nebula" -Recurse -Filter *.mfa -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -ne "template.mfa" } | Select-Object -First 1
+          if (-not $mfa) { Write-Host "SKIP: no MFA from TEST 3"; exit 0 }
+          & "$root/nebula/Nebula.exe" -path $mfa.FullName -forcetype mfa -tool "JSON Dump" -closeonfinish *>&1 |
+            Tee-Object -FilePath "$root/logs/05_json_dump_mfa.log"
+          Write-Host "EXIT: $LASTEXITCODE"
+          $json = Get-ChildItem "$root/nebula" -Recurse -Filter game_model.json -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($json) { Write-Host "JSON from MFA: $($json.FullName) ($([math]::Round($json.Length/1KB,1)) KB)" }
+
+      - name: "TEST 6 — wrong tool name (verify graceful error, not crash)"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          & "$root/nebula/Nebula.exe" -path "$root/game/data/konosuba.exe" -forcetype exe -tool "NonExistentTool" -closeonfinish *>&1 |
+            Tee-Object -FilePath "$root/logs/06_wrong_tool.log"
+          Write-Host "EXIT: $LASTEXITCODE (expect 4)"
+
+      - name: "TEST 7 — missing -path (verify graceful error)"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          & "$root/nebula/Nebula.exe" -forcetype exe -closeonfinish *>&1 |
+            Tee-Object -FilePath "$root/logs/07_no_path.log"
+          Write-Host "EXIT: $LASTEXITCODE (expect 2)"
+
+      - name: Collect JSON outputs (if any)
+        shell: pwsh
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          New-Item -ItemType Directory -Force "$root/logs/json_outputs" | Out-Null
+          Get-ChildItem "$root/nebula" -Recurse -Filter game_model.json -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName "$root/logs/json_outputs/$($_.Directory.Name)_$($_.Name)" -Force }
+          Get-ChildItem "$root/nebula" -Recurse -Filter *.mfa -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne "template.mfa" } |
+            ForEach-Object { Copy-Item $_.FullName "$root/logs/json_outputs/$($_.Name)" -Force }
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+          Write-Host "========== LOG FILES =========="
+          Get-ChildItem "$root/logs" -Filter *.log | ForEach-Object {
+            $lines = (Get-Content $_.FullName | Measure-Object -Line).Lines
+            Write-Host ("{0,-40} {1,6} lines" -f $_.Name, $lines)
+          }
+          Write-Host ""
+          Write-Host "========== JSON OUTPUTS =========="
+          Get-ChildItem "$root/logs/json_outputs" -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host ("{0,-40} {1,8} KB" -f $_.Name, [math]::Round($_.Length/1KB,1))
+          }
+          Write-Host ""
+          Write-Host "========== KEY CHECKS =========="
+          # Check if headless markers appear in logs (proves our patch runs)
+          foreach ($log in (Get-ChildItem "$root/logs" -Filter *.log)) {
+            $content = Get-Content $log.FullName -Raw
+            if ($content -match '\[headless\]') { Write-Host "  $($log.Name): contains [headless] markers ✓" }
+            else                                { Write-Host "  $($log.Name): NO [headless] markers (patch may not be active)" }
+          }
+
+      - name: Upload logs only
+        uses: actions/upload-artifact@v4
+        with:
+          name: nebula-cli-test-logs
+          path: logs/
+          retention-days: 30
