@@ -57,7 +57,7 @@ jobs:
           $root = $env:GITHUB_WORKSPACE
           New-Item -ItemType Directory -Force "$root/logs" | Out-Null
           & "$root/nebula/Nebula.exe" -path "$root/game/data/konosuba.exe" -forcetype exe -listtools -closeonfinish *>&1 |
-            Tee-Object -FilePath "$root/logs/01_listtools.log"
+            Tee-Object -FilePath "$root/logs/01_listtools.txt"
           Write-Host "EXIT: $LASTEXITCODE"
 
       - name: "TEST 2 — read-only pass (no -tool, just verify headless read works)"
@@ -66,7 +66,7 @@ jobs:
         run: |
           $root = $env:GITHUB_WORKSPACE
           & "$root/nebula/Nebula.exe" -path "$root/game/data/konosuba.exe" -forcetype exe -closeonfinish *>&1 |
-            Tee-Object -FilePath "$root/logs/02_readonly.log"
+            Tee-Object -FilePath "$root/logs/02_readonly.txt"
           Write-Host "EXIT: $LASTEXITCODE"
 
       - name: "TEST 3 — MFA Parser tool (existing tool via CLI)"
@@ -75,7 +75,7 @@ jobs:
         run: |
           $root = $env:GITHUB_WORKSPACE
           & "$root/nebula/Nebula.exe" -path "$root/game/data/konosuba.exe" -forcetype exe -tool "MFA Parser" -closeonfinish *>&1 |
-            Tee-Object -FilePath "$root/logs/03_mfa_parser.log"
+            Tee-Object -FilePath "$root/logs/03_mfa_parser.txt"
           Write-Host "EXIT: $LASTEXITCODE"
           # Check if MFA was produced
           $mfa = Get-ChildItem "$root/nebula" -Recurse -Filter *.mfa -ErrorAction SilentlyContinue |
@@ -89,10 +89,10 @@ jobs:
         run: |
           $root = $env:GITHUB_WORKSPACE
           & "$root/nebula/Nebula.exe" -path "$root/game/data/konosuba.exe" -forcetype exe -tool "JSON Dump" -closeonfinish *>&1 |
-            Tee-Object -FilePath "$root/logs/04_json_dump_exe.log"
+            Tee-Object -FilePath "$root/logs/04_json_dump_exe.txt"
           Write-Host "EXIT: $LASTEXITCODE"
           # Check if JSON was produced
-          $json = Get-ChildItem "$root/nebula" -Recurse -Filter game_model.json -ErrorAction SilentlyContinue
+          $json = Get-ChildItem "$root/nebula" -Recurse -Filter game_model*.json -ErrorAction SilentlyContinue
           if ($json) { Write-Host "JSON produced: $($json.FullName) ($([math]::Round($json.Length/1KB,1)) KB)" }
           else       { Write-Host "WARNING: no game_model.json produced" }
 
@@ -105,9 +105,9 @@ jobs:
                  Where-Object { $_.Name -ne "template.mfa" } | Select-Object -First 1
           if (-not $mfa) { Write-Host "SKIP: no MFA from TEST 3"; exit 0 }
           & "$root/nebula/Nebula.exe" -path $mfa.FullName -forcetype mfa -tool "JSON Dump" -closeonfinish *>&1 |
-            Tee-Object -FilePath "$root/logs/05_json_dump_mfa.log"
+            Tee-Object -FilePath "$root/logs/05_json_dump_mfa.txt"
           Write-Host "EXIT: $LASTEXITCODE"
-          $json = Get-ChildItem "$root/nebula" -Recurse -Filter game_model.json -ErrorAction SilentlyContinue |
+          $json = Get-ChildItem "$root/nebula" -Recurse -Filter game_model*.json -ErrorAction SilentlyContinue |
                   Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if ($json) { Write-Host "JSON from MFA: $($json.FullName) ($([math]::Round($json.Length/1KB,1)) KB)" }
 
@@ -117,7 +117,7 @@ jobs:
         run: |
           $root = $env:GITHUB_WORKSPACE
           & "$root/nebula/Nebula.exe" -path "$root/game/data/konosuba.exe" -forcetype exe -tool "NonExistentTool" -closeonfinish *>&1 |
-            Tee-Object -FilePath "$root/logs/06_wrong_tool.log"
+            Tee-Object -FilePath "$root/logs/06_wrong_tool.txt"
           Write-Host "EXIT: $LASTEXITCODE (expect 4)"
 
       - name: "TEST 7 — missing -path (verify graceful error)"
@@ -126,7 +126,7 @@ jobs:
         run: |
           $root = $env:GITHUB_WORKSPACE
           & "$root/nebula/Nebula.exe" -forcetype exe -closeonfinish *>&1 |
-            Tee-Object -FilePath "$root/logs/07_no_path.log"
+            Tee-Object -FilePath "$root/logs/07_no_path.txt"
           Write-Host "EXIT: $LASTEXITCODE (expect 2)"
 
       - name: Collect JSON outputs (if any)
@@ -134,7 +134,7 @@ jobs:
         run: |
           $root = $env:GITHUB_WORKSPACE
           New-Item -ItemType Directory -Force "$root/logs/json_outputs" | Out-Null
-          Get-ChildItem "$root/nebula" -Recurse -Filter game_model.json -ErrorAction SilentlyContinue |
+          Get-ChildItem "$root/nebula" -Recurse -Filter game_model*.json -ErrorAction SilentlyContinue |
             ForEach-Object { Copy-Item $_.FullName "$root/logs/json_outputs/$($_.Directory.Name)_$($_.Name)" -Force }
           Get-ChildItem "$root/nebula" -Recurse -Filter *.mfa -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -ne "template.mfa" } |
@@ -145,7 +145,7 @@ jobs:
         run: |
           $root = $env:GITHUB_WORKSPACE
           Write-Host "========== LOG FILES =========="
-          Get-ChildItem "$root/logs" -Filter *.log | ForEach-Object {
+          Get-ChildItem "$root/logs" -Filter *.txt | ForEach-Object {
             $lines = (Get-Content $_.FullName | Measure-Object -Line).Lines
             Write-Host ("{0,-40} {1,6} lines" -f $_.Name, $lines)
           }
@@ -157,7 +157,7 @@ jobs:
           Write-Host ""
           Write-Host "========== KEY CHECKS =========="
           # Check if headless markers appear in logs (proves our patch runs)
-          foreach ($log in (Get-ChildItem "$root/logs" -Filter *.log)) {
+          foreach ($log in (Get-ChildItem "$root/logs" -Filter *.txt)) {
             $content = Get-Content $log.FullName -Raw
             if ($content -match '\[headless\]') { Write-Host "  $($log.Name): contains [headless] markers ✓" }
             else                                { Write-Host "  $($log.Name): NO [headless] markers (patch may not be active)" }

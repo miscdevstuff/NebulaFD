@@ -102,7 +102,8 @@ namespace Nebula
                 { Console.Error.WriteLine("ERROR: no tool named '" + ToolName + "'. Use -listtools."); Environment.Exit(4); }
                 Console.WriteLine($"[headless] executing tool: {tool.Name}");
                 var sw = Stopwatch.StartNew();
-                tool.Execute();
+                try { tool.Execute(); }
+                catch (Exception ex) { Console.WriteLine($"[headless] TOOL '{tool.Name}' THREW:\n{ex}"); }
                 sw.Stop();
                 Console.WriteLine($"[headless] tool '{tool.Name}' finished in {sw.Elapsed.TotalSeconds:F2}s");
             }

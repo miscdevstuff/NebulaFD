@@ -10,27 +10,29 @@ using System.Runtime.CompilerServices;
 namespace Nebula.Tools.GameDumper
 {
     /// <summary>
-    /// Recursively serializes NebulaFD's in-memory PackageData model to JSON.
-    /// Uses deep object-graph walking (not hardcoded property names) so it
-    /// cannot miss data due to naming mismatches. Filters known-internal
-    /// Chunk base-class fields to reduce noise.
+    /// v3: deep object-graph serializer with corrected leaf handling.
+    /// Fixes vs v2: (1) primitives/strings serialize at ANY depth (leaf-order bug),
+    /// (2) collection cap raised so big frames' events aren't truncated at 500,
+    /// (3) object effects + shader refs captured by deep-dumping the Header
+    ///     (effects are flat on Header, not a nested object),
+    /// (4) shader bank(s) captured by name-substring discovery (no hardcoded names),
+    /// (5) Parent back-reference skipped to prevent bloat,
+    /// (6) single reader-tagged output file (no dup, no EXE/MFA clobber).
     /// </summary>
     public class JsonDump : INebulaTool
     {
         public string Name => "JSON Dump";
 
-        // ---- configuration ----
-        const int MaxDepth = 5;
-        const int MaxCollectionItems = 500;
+        const int MaxDepth = 10;
+        const int MaxCollectionItems = 1_000_000;
 
-        // Fields/properties to skip (Chunk base-class bookkeeping + stream objects)
         static readonly HashSet<string> SkipNames = new(StringComparer.OrdinalIgnoreCase)
         {
             "ChunkName", "ChunkID", "ChunkSize", "ChunkData",
             "Log", "Logger",
+            "Parent", // back-reference to the owning events/frame: pure nav link, causes bloat/circular noise
         };
 
-        // Types to never recurse into
         static readonly HashSet<Type> OpaqueTypes = new()
         {
             typeof(System.IO.Stream),
@@ -43,7 +45,6 @@ namespace Nebula.Tools.GameDumper
             typeof(ByteWriter),
         };
 
-        // Circular-reference guard
         readonly ConditionalWeakTable<object, object?> _visited = new();
 
         public void Execute()
@@ -51,31 +52,27 @@ namespace Nebula.Tools.GameDumper
             var dat = NebulaCore.PackageData;
             var root = new JObject
             {
-                ["_tool"] = "JsonDump v2 (deep object-graph serializer)",
-                ["_note"] = "Recursively serialized from NebulaFD in-memory model. " +
-                            "All public fields/properties are included. " +
-                            "Global value/string names and alt-value names are empty " +
-                            "because they don't exist in compiled EXEs (editor-only metadata).",
+                ["_tool"] = "JsonDump v3 (deep object-graph, leaf-corrected)",
+                ["_note"] = "Names for global/alterable values are absent because compiled EXEs " +
+                            "(and MFA derived from them) don't store them (editor-only metadata). " +
+                            "Effects live flat on each object Header; shaders captured by name discovery.",
                 ["app_name"] = dat.AppName,
                 ["fusion_build"] = dat.ProductBuild,
             };
 
-            // ---- top-level summary (quick-reference counts) ----
-            root["summary"] = new JObject
+            // ---- summary (music/font = 0 is CORRECT here: BGM + TTFs are external files) ----
+            root["summary"] = Safe(() => new JObject
             {
                 ["frame_count"] = dat.Frames.Count,
-                ["object_count"] = dat.FrameItems.Items.Count,
-                ["image_count"] = dat.ImageBank.Images.Count,
+                ["object_def_count"] = dat.FrameItems.Items.Count,
+                ["image_bank_count"] = dat.ImageBank.Images.Count,
                 ["sound_count"] = dat.SoundBank.Sounds.Count,
                 ["music_count"] = dat.MusicBank.Music.Count,
                 ["font_count"] = dat.TrueTypeFontBank.Fonts.Count,
-                ["shader_count"] = CountShaders(dat),
                 ["extension_count"] = dat.Extensions.Exts.Count,
-                ["packed_data_count"] = dat.PackData.Items.Length,
-                ["binary_file_count"] = dat.BinaryFiles.Items.Count,
-            };
+            });
 
-            // ---- extensions (small, always useful) ----
+            // ---- extensions ----
             root["extensions"] = SafeArray(() =>
             {
                 var a = new JArray();
@@ -90,93 +87,76 @@ namespace Nebula.Tools.GameDumper
                 return a;
             });
 
-            // ---- shaders (BOTH banks) ----
-            root["shaders"] = SafeArray(() =>
+            // ---- shaders: capture EVERY PackageData member whose name contains "Shader"
+            //      (ShaderBank, and any DX9/other bank, by substring -> no hardcoded names) ----
+            root["shader_related"] = Safe(() =>
             {
-                var a = new JArray();
-                DumpShaderBank(dat.ShaderBank, a, "ShaderBank");
-                DumpDX9ShaderBank(dat, a);
-                return a;
+                var node = new JObject();
+                foreach (var f in dat.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance))
+                    if (f.Name.IndexOf("Shader", StringComparison.OrdinalIgnoreCase) >= 0)
+                        node[f.Name] = DeepDump(f.GetValue(dat), 6);
+                foreach (var p in dat.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                    if (p.Name.IndexOf("Shader", StringComparison.OrdinalIgnoreCase) >= 0
+                        && p.CanRead && p.GetIndexParameters().Length == 0)
+                        node[p.Name] = DeepDump(p.GetValue(dat), 6);
+                return node;
             });
 
-            // ---- global values/strings (will be empty for EXE reads — that's correct) ----
-            root["global_values"] = DeepDump(GetFieldOrProp(dat, "GlobalValues"), 2);
-            root["global_strings"] = DeepDump(GetFieldOrProp(dat, "GlobalStrings"), 2);
-            root["global_flags"] = DeepDump(GetFieldOrProp(dat, "GlobalFlags"), 2);
+            // ---- globals: data now survives (leaf fix); names genuinely absent ----
+            root["global_values"]  = DeepDump(GetFieldOrProp(dat, "GlobalValues"), 4);
+            root["global_strings"] = DeepDump(GetFieldOrProp(dat, "GlobalStrings"), 4);
+            root["global_flags"]   = DeepDump(GetFieldOrProp(dat, "GlobalFlags"), 4);
 
-            // ---- objects (definitions: name, type, effects, alt-values) ----
+            // ---- object definitions: name + full Header (effects + shader refs) + alterables ----
             root["objects"] = SafeArray(() =>
             {
                 var a = new JArray();
                 foreach (var kv in dat.FrameItems.Items)
                 {
                     var oi = kv.Value;
+                    var header = GetFieldOrProp(oi, "Header");
                     var obj = new JObject
                     {
-                        ["handle"] = JT(() => GetFieldOrProp(GetFieldOrProp(oi, "Header"), "Handle")),
-                        ["type"] = JT(() => GetFieldOrProp(GetFieldOrProp(oi, "Header"), "Type")),
                         ["name"] = oi.Name,
-                        ["ink_effect"] = JT(() => GetFieldOrProp(GetFieldOrProp(oi, "Header"), "InkEffect")),
-                        ["ink_param"] = JT(() => GetFieldOrProp(GetFieldOrProp(oi, "Header"), "InkEffectParam")),
+                        ["handle"] = JT(() => GetFieldOrProp(header, "Handle")),
+                        ["type"] = JT(() => GetFieldOrProp(header, "Type")),
+                        // Header carries InkEffect, InkEffectParam, RGBCoeff, BlendCoeff,
+                        // Shader (shared def, with Name) and ShaderParameters (per-object values).
+                        ["header"] = DeepDump(header, 8),
+                        ["alterable"] = DumpAlterables(oi),
                     };
-
-                    // Object-level effects: try multiple known locations
-                    obj["effects"] = DumpObjectEffects(oi);
-
-                    // Alterable values/strings/flags: try multiple known locations
-                    obj["alterable"] = DumpAlterables(oi);
-
                     a.Add(obj);
                 }
                 return a;
             });
 
-            // ---- frames (name, size, instances, events — deep-dumped) ----
+            // ---- frames: name/size + instances (deep) + events (deep) + frame-level effects ----
             root["frames"] = SafeArray(() =>
             {
                 var a = new JArray();
                 foreach (var frame in dat.Frames)
                 {
+                    var fhdr = GetFieldOrProp(frame, "FrameHeader");
                     var f = new JObject
                     {
                         ["handle"] = JT(() => frame.Handle),
                         ["name"] = frame.FrameName,
-                        ["width"] = JT(() => GetFieldOrProp(frame, "FrameHeader") != null
-                            ? GetFieldOrProp(GetFieldOrProp(frame, "FrameHeader"), "Width") : null),
-                        ["height"] = JT(() => GetFieldOrProp(frame, "FrameHeader") != null
-                            ? GetFieldOrProp(GetFieldOrProp(frame, "FrameHeader"), "Height") : null),
+                        ["width"] = JT(() => GetFieldOrProp(fhdr, "Width")),
+                        ["height"] = JT(() => GetFieldOrProp(fhdr, "Height")),
                     };
 
-                    // Instances (placed objects in this frame)
                     f["instances"] = SafeArray(() =>
                     {
                         var ia = new JArray();
-                        var instances = GetFieldOrProp(frame, "FrameInstances");
-                        if (instances == null) return ia;
-                        var coll = GetFieldOrProp(instances, "Instances") as IEnumerable;
-                        if (coll == null) return ia;
-                        foreach (var ins in coll)
-                        {
-                            if (ins == null) continue;
-                            ia.Add(new JObject
-                            {
-                                ["x"] = JT(() => GetFieldOrProp(ins, "PositionX")),
-                                ["y"] = JT(() => GetFieldOrProp(ins, "PositionY")),
-                                ["layer"] = JT(() => GetFieldOrProp(ins, "Layer")),
-                                ["object_handle"] = JT(() => GetFieldOrProp(ins, "ObjectInfo")),
-                            });
-                        }
+                        var coll = GetFieldOrProp(GetFieldOrProp(frame, "FrameInstances"), "Instances") as IEnumerable;
+                        if (coll != null) foreach (var ins in coll) ia.Add(DeepDump(ins, 4));
                         return ia;
                     });
 
-                    // Events: deep-dump the entire events object graph
                     f["events"] = DumpFrameEvents(frame);
-
-                    // Frame effects, layers, shaders — deep-dump whatever exists
-                    f["frame_effects"] = DeepDump(GetFieldOrProp(frame, "FrameEffects"), 3);
-                    f["layers"] = DeepDump(GetFieldOrProp(frame, "Layers"), 3);
-                    f["frame_shader_settings"] = DeepDump(GetFieldOrProp(frame, "FrameShaderSettings"), 3);
-
+                    f["frame_effects"] = DeepDump(GetFieldOrProp(frame, "FrameEffects"), 6);
+                    f["layers"] = DeepDump(GetFieldOrProp(frame, "Layers"), 6);
+                    f["frame_shader_settings"] = DeepDump(GetFieldOrProp(frame, "FrameShaderSettings"), 6);
                     a.Add(f);
                 }
                 return a;
@@ -193,29 +173,25 @@ namespace Nebula.Tools.GameDumper
         }
 
         // ================================================================
-        //  DEEP DUMP — recursive object-graph serializer
+        //  DEEP DUMP  (leaf-corrected: primitives/strings survive any depth)
         // ================================================================
-
         JToken DeepDump(object? obj, int depth)
         {
             if (obj == null) return JValue.CreateNull();
-            if (depth <= 0) return new JValue($"<max depth: {obj.GetType().Name}>");
-
             var type = obj.GetType();
 
-            // Primitives and strings
+            // --- leaves FIRST, regardless of depth ---
+            var underlying = Nullable.GetUnderlyingType(type);
+            if (underlying != null)
+                return JToken.FromObject(obj);
             if (type.IsPrimitive || type == typeof(string) || type == typeof(decimal))
                 return JToken.FromObject(obj);
-
-            // Enums
             if (type.IsEnum)
                 return new JValue(obj.ToString());
-
-            // Opaque types (Bitmap, Stream, ByteReader, etc.)
             if (OpaqueTypes.Contains(type) || OpaqueTypes.Any(t => t.IsAssignableFrom(type)))
                 return new JValue($"<{type.Name}>");
 
-            // Circular reference check
+            // --- circular guard (reference types only) ---
             if (!type.IsValueType)
             {
                 if (_visited.TryGetValue(obj, out _))
@@ -223,60 +199,45 @@ namespace Nebula.Tools.GameDumper
                 _visited.AddOrUpdate(obj, null);
             }
 
-            // Arrays
+            // --- depth cap applies ONLY to complex types now ---
+            if (depth <= 0)
+                return new JValue($"<max depth: {type.Name}>");
+
             if (type.IsArray)
             {
                 var arr = (Array)obj;
                 var ja = new JArray();
                 int count = Math.Min(arr.Length, MaxCollectionItems);
-                for (int i = 0; i < count; i++)
-                    ja.Add(DeepDump(arr.GetValue(i), depth - 1));
-                if (arr.Length > MaxCollectionItems)
-                    ja.Add(new JValue($"<... {arr.Length - MaxCollectionItems} more>"));
+                for (int i = 0; i < count; i++) ja.Add(DeepDump(arr.GetValue(i), depth - 1));
+                if (arr.Length > MaxCollectionItems) ja.Add(new JValue($"<... {arr.Length - MaxCollectionItems} more>"));
                 return ja;
             }
-
-            // Dictionaries
             if (obj is IDictionary dict)
             {
                 var jo = new JObject();
                 int count = 0;
                 foreach (DictionaryEntry entry in dict)
                 {
-                    if (count++ >= MaxCollectionItems)
-                    {
-                        jo["_truncated"] = $"<{dict.Count - MaxCollectionItems} more>";
-                        break;
-                    }
-                    string key = entry.Key?.ToString() ?? "null";
-                    key = key.Replace(".", "_").Replace("/", "_");
+                    if (count++ >= MaxCollectionItems) { jo["_truncated"] = $"<{dict.Count - MaxCollectionItems} more>"; break; }
+                    string key = (entry.Key?.ToString() ?? "null").Replace(".", "_").Replace("/", "_");
                     jo[key] = DeepDump(entry.Value, depth - 1);
                 }
                 return jo;
             }
-
-            // IEnumerable (List<T>, etc.) but not string
             if (obj is IEnumerable enumerable && type != typeof(string))
             {
                 var ja = new JArray();
                 int count = 0;
                 foreach (var item in enumerable)
                 {
-                    if (count++ >= MaxCollectionItems)
-                    {
-                        ja.Add(new JValue($"<... truncated>"));
-                        break;
-                    }
+                    if (count++ >= MaxCollectionItems) { ja.Add(new JValue("<... truncated>")); break; }
                     ja.Add(DeepDump(item, depth - 1));
                 }
                 return ja;
             }
 
-            // Complex object: dump all public fields + properties
-            var result = new JObject();
-            result["_type"] = type.Name;
-
-            // Fields
+            // --- complex object: public fields + properties ---
+            var result = new JObject { ["_type"] = type.Name };
             foreach (var field in type.GetFields(BindingFlags.Public | BindingFlags.Instance))
             {
                 if (SkipNames.Contains(field.Name)) continue;
@@ -284,34 +245,24 @@ namespace Nebula.Tools.GameDumper
                 try { result[field.Name] = DeepDump(field.GetValue(obj), depth - 1); }
                 catch { result[field.Name] = new JValue("<error>"); }
             }
-
-            // Properties (skip indexers and write-only)
             foreach (var prop in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
             {
                 if (SkipNames.Contains(prop.Name)) continue;
-                if (prop.GetIndexParameters().Length > 0) continue;
-                if (!prop.CanRead) continue;
+                if (prop.GetIndexParameters().Length > 0 || !prop.CanRead) continue;
                 if (type.GetField(prop.Name, BindingFlags.Public | BindingFlags.Instance) != null) continue;
                 try { result[prop.Name] = DeepDump(prop.GetValue(obj), depth - 1); }
                 catch { result[prop.Name] = new JValue("<error>"); }
             }
-
             return result;
         }
 
         // ================================================================
-        //  SPECIALIZED DUMPERS (for known structures)
-        // ================================================================
-
         JToken DumpFrameEvents(object frame)
         {
             object? events = GetFieldOrProp(frame, "Events")
                           ?? GetFieldOrProp(frame, "FrameEvents")
                           ?? GetFieldOrProp(frame, "events");
-
             if (events == null) return new JArray();
-
-            // Try known collection names inside the events object
             foreach (var name in new[] { "Events", "EventList", "Items", "TopLevelEvents", "EventGroups" })
             {
                 var coll = GetFieldOrProp(events, name);
@@ -327,42 +278,13 @@ namespace Nebula.Tools.GameDumper
                     return a;
                 }
             }
-
-            // Fallback: deep-dump the entire events object
             return DeepDump(events, MaxDepth);
-        }
-
-        JToken DumpObjectEffects(object oi)
-        {
-            var e = new JObject();
-
-            // EXE-read: ink effect is on Header directly — use reflection since oi is object
-            var header = GetFieldOrProp(oi, "Header");
-            e["ink_effect"] = JT(() => GetFieldOrProp(header, "InkEffect"));
-            e["ink_param"] = JT(() => GetFieldOrProp(header, "InkEffectParam"));
-
-            // MFA-read: MFAObjectEffects chunk stored on the object
-            foreach (var loc in new[] { oi, GetFieldOrProp(oi, "Properties") })
-            {
-                if (loc == null) continue;
-                var eff = GetFieldOrProp(loc, "ObjectEffects")
-                       ?? GetFieldOrProp(loc, "Effects")
-                       ?? GetFieldOrProp(loc, "MFAObjectEffects");
-                if (eff != null)
-                {
-                    e["mfa_effects"] = DeepDump(eff, 3);
-                    break;
-                }
-            }
-
-            return e;
         }
 
         JToken DumpAlterables(object oi)
         {
             var alt = new JObject();
             var props = GetFieldOrProp(oi, "Properties") ?? oi;
-
             foreach (var (jsonKey, typeNames) in new[] {
                 ("values",  new[] { "ObjectAlterableValues", "AlterableValues", "AltValues" }),
                 ("strings", new[] { "ObjectAlterableStrings", "AlterableStrings", "AltStrings" }),
@@ -370,84 +292,13 @@ namespace Nebula.Tools.GameDumper
             })
             {
                 object? found = null;
-                foreach (var name in typeNames)
-                {
-                    found = GetFieldOrProp(props, name);
-                    if (found != null) break;
-                }
-                alt[jsonKey] = found != null ? DeepDump(found, 3) : new JArray();
+                foreach (var n in typeNames) { found = GetFieldOrProp(props, n); if (found != null) break; }
+                alt[jsonKey] = found != null ? DeepDump(found, 4) : new JArray();
             }
-
             return alt;
         }
 
-        void DumpShaderBank(object? bank, JArray target, string source)
-        {
-            if (bank == null) return;
-            var shaders = GetFieldOrProp(bank, "Shaders");
-            if (shaders is IDictionary dict)
-            {
-                foreach (DictionaryEntry entry in dict)
-                {
-                    var sh = entry.Value;
-                    if (sh == null) continue;
-                    var s = new JObject
-                    {
-                        ["_source"] = source,
-                        ["handle"] = entry.Key?.ToString(),
-                        ["name"] = GetFieldOrProp(sh, "Name")?.ToString(),
-                    };
-                    var parms = GetFieldOrProp(sh, "Parameters");
-                    if (parms is IEnumerable pEnum && parms is not string)
-                    {
-                        var pa = new JArray();
-                        foreach (var par in pEnum)
-                        {
-                            if (par == null) continue;
-                            pa.Add(new JObject
-                            {
-                                ["name"] = GetFieldOrProp(par, "Name")?.ToString(),
-                                ["value"] = GetFieldOrProp(par, "Value")?.ToString(),
-                                ["type"] = GetFieldOrProp(par, "Type")?.ToString(),
-                            });
-                        }
-                        s["parameters"] = pa;
-                    }
-                    target.Add(s);
-                }
-            }
-        }
-
-        void DumpDX9ShaderBank(object dat, JArray target)
-        {
-            var dx9 = GetFieldOrProp(dat, "DX9ShaderBank");
-            if (dx9 != null)
-                DumpShaderBank(dx9, target, "DX9ShaderBank");
-        }
-
-        int CountShaders(object dat)
-        {
-            int count = 0;
-            var sb = GetFieldOrProp(dat, "ShaderBank");
-            if (sb != null)
-            {
-                var shaders = GetFieldOrProp(sb, "Shaders");
-                if (shaders is IDictionary d) count += d.Count;
-            }
-            var dx9 = GetFieldOrProp(dat, "DX9ShaderBank");
-            if (dx9 != null)
-            {
-                var shaders = GetFieldOrProp(dx9, "Shaders");
-                if (shaders is IDictionary d) count += d.Count;
-            }
-            return count;
-        }
-
         // ================================================================
-        //  HELPERS
-        // ================================================================
-
-        /// <summary>Try field first, then property. Returns null if neither exists.</summary>
         static object? GetFieldOrProp(object? obj, string name)
         {
             if (obj == null) return null;
@@ -460,7 +311,6 @@ namespace Nebula.Tools.GameDumper
             return null;
         }
 
-        /// <summary>Returns a JToken from a lambda; null/exception → JValue.Null.</summary>
         static JToken JT(Func<object?> f)
         {
             try { var v = f(); return v != null ? JToken.FromObject(v) : JValue.CreateNull(); }
@@ -468,6 +318,12 @@ namespace Nebula.Tools.GameDumper
         }
 
         static JToken SafeArray(Func<JArray> f)
+        {
+            try { return f(); }
+            catch (Exception ex) { return new JObject { ["_error"] = ex.GetType().Name + ": " + ex.Message }; }
+        }
+
+        static JToken Safe(Func<JToken> f)
         {
             try { return f(); }
             catch (Exception ex) { return new JObject { ["_error"] = ex.GetType().Name + ": " + ex.Message }; }
