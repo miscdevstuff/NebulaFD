@@ -21,7 +21,7 @@ namespace Nebula
         static string? ForceType;     // exe | ccn | mfa | apk | anm | agmi | zip | ipa
         static string? ToolName;      // exact INebulaTool.Name, or null
         static bool   ListTools;
-        static bool   CloseOnFinish;
+        //static bool   CloseOnFinish;
 
         static async Task Main(string[] args)
         {
@@ -44,7 +44,7 @@ namespace Nebula
         }
 
         // ------------------------------------------------------------------
-        //  HEADLESS PATH  (-path -forcetype -tool -listtools -closeonfinish)
+        //  HEADLESS PATH  (-path -forcetype -tool -listtools) // -closeonfinish
         // ------------------------------------------------------------------
         static void ParseArgs(string[] args)
         {
@@ -58,7 +58,7 @@ namespace Nebula
                     case "-forcetype":     ForceType = Next().ToLowerInvariant(); break;
                     case "-tool":          ToolName = Next(); break;
                     case "-listtools":     ListTools = true; break;
-                    case "-closeonfinish": CloseOnFinish = true; break;
+                    //case "-closeonfinish": CloseOnFinish = true; break;
                 }
             }
         }
